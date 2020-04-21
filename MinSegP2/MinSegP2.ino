@@ -19,8 +19,8 @@ int B3[10];
 double Setpoint, Input, Output, CSG_OUTPUTV1;
 
 //Specify the links and initial tuning parameters
-double Kp = 10, Ki = 60, Kd = 1.4;
-PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
+double Kp = 0, Ki = 60, Kd = 100;
+PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, REVERSE);
 
 
 //-----------PID POS--------------
@@ -28,7 +28,8 @@ PID myPID(&Input, &Output, &Setpoint, Kp, Ki, Kd, DIRECT);
 double SetpointPos, InputPos, OutputPos, CSG_OUTPUTV1Pos;
 
 //Specify the links and initial tuning parameters
-double KpPos = 4, KiPos = 0, KdPos = 0;
+double KpPos = 1.9, KiPos = 0.20, KdPos = 0.12;
+double KpPosD = 0.5, KiPosD = 0.20, KdPosD = 0.12;
 PID myPIDPos(&InputPos, &OutputPos, &SetpointPos, KpPos, KiPos, KdPos, DIRECT);
 
 
@@ -39,36 +40,57 @@ int sensorValue = 0;  // variable to store the value coming from the sensor
 
 
 //---------VARIABLES GIRO--------------
-#include "MPU6050_6Axis_MotionApps20.h"
+#include <Wire.h>
 
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-#include "Wire.h"
-#endif
+#define MPU6050 0x68              //Device address (standard)
+#define ACCEL_CONFIG 0x1C         //Accelerometer configuration address
+#define GYRO_CONFIG 0x1B          //Gyro configuration address
 
-#define MIN_ABS_SPEED 20
+//Registers: Accelerometer, Temp, Gyroscope
+#define ACCEL_XOUT_H 0x3B
+#define ACCEL_XOUT_L 0x3C
+#define ACCEL_YOUT_H 0x3D
+#define ACCEL_YOUT_L 0x3E
+#define ACCEL_ZOUT_H 0x3F
+#define ACCEL_ZOUT_L 0x40
+#define TEMP_OUT_H 0x41
+#define TEMP_OUT_L 0x42
+#define GYRO_XOUT_H 0x43
+#define GYRO_XOUT_L 0x44
+#define GYRO_YOUT_H 0x45
+#define GYRO_YOUT_L 0x46
+#define GYRO_ZOUT_H 0x47
+#define GYRO_ZOUT_L 0x48
 
-MPU6050 mpu;
-double Angle = 0;
-double AngleMemo = 0;
-// MPU control/status vars
-bool dmpReady = false;  // set true if DMP init was successful
-uint8_t mpuIntStatus;   // holds actual interrupt status byte from MPU
-uint8_t devStatus;      // return status after each device operation (0 = success, !0 = error)
-uint16_t packetSize;    // expected DMP packet size (default is 42 bytes)
-uint16_t fifoCount;     // count of all bytes currently in FIFO
-uint8_t fifoBuffer[64]; // FIFO storage buffer
-
-// orientation/motion vars
-Quaternion q;           // [w, x, y, z]         quaternion container
-VectorFloat gravity;    // [x, y, z]            gravity vector
-float ypr[3];           // [yaw, pitch, roll]   yaw/pitch/roll container and gravity vector
+#define PWR_MGMT_1 0x6B
+#define PWR_MGMT_2 0x6C
 
 
-//timers
-long time1Hz = 0;
-long time5Hz = 0;
+//Sensor output scaling
+#define accSens 0             // 0 = 2g, 1 = 4g, 2 = 8g, 3 = 16g
+#define gyroSens 1            // 0 = 250rad/s, 1 = 500rad/s, 2 1000rad/s, 3 = 2000rad/s
 
-volatile bool mpuInterrupt = false;     // indicates whether MPU interrupt pin has gone high
+
+int16_t  AcZ, AcX, GyY;       // my gyro with x forward, y left-right, z vertical
+
+int16_t  AcZ_offset = 0;
+int16_t  AcX_offset = 0;
+int16_t  GyY_offset = 0;
+int32_t  GyY_offset_sum = 0;
+
+int32_t GyY_filter[32];
+uint8_t filter_count = 0;
+int32_t  GyY_F;
+double robot_angle;
+
+;
+double Acc_angle, Acc_angleMemo, DiffPos;          //angle calculated from acc. measurments
+
+bool vertical = false;      //is the robot vertical enough to run
+
+bool GyY_filter_on = true;  //apply simple average filter to Z gyro reading
+
+#define Gyro_amount 0.996   //percent of gyro in complementary filter T/(T+del_t) del_t: sampling rate, T acc. timeconstant ~1s
 
 
 
@@ -173,21 +195,19 @@ void callback() {
 //SoftwareSerial bluetoothSerial =  SoftwareSerial(2,3);   // arduino RX pin=2  arduino TX pin=3    connect the arduino RX pin to bluetooth module TX pin   -  connect the arduino TX pin to bluetooth module RX pin.  Disable this line if you want to use hardware serial
 VirtuinoBluetooth virtuino(Serial2, 9600);
 
-//--------------GESTION IRQ GIRO--------------
-void dmpDataReady()
-{
-  mpuInterrupt = true;
-}
 
 
 //******************SETUP*****************************
 void setup() {
 
+
   Serial.begin(115200);
+
 
   //------------------PID POSITION--------------
   myPIDPos.SetMode(AUTOMATIC);
   myPIDPos.SetOutputLimits(-255, 255);
+  myPIDPos.SetTunings(KpPos, KiPos, KdPos);
   myPIDPos.SetSampleTime(10);
 
   //------------------PID VITESSE--------------
@@ -200,64 +220,8 @@ void setup() {
 
 
   //------------GYRO---------------------
-  // join I2C bus (I2Cdev library doesn't do this automatically)
-#if I2CDEV_IMPLEMENTATION == I2CDEV_ARDUINO_WIRE
-  Wire.begin();
-  TWBR = 24; // 400kHz I2C clock (200kHz if CPU is 8MHz)
-#elif I2CDEV_IMPLEMENTATION == I2CDEV_BUILTIN_FASTWIRE
-  Fastwire::setup(400, true);
-#endif
+  angle_init();
 
-  // initialize device
-  //Serial.println(F("Initializing I2C devices..."));
-  mpu.initialize();
-
-  // verify connection
-  //Serial.println(F("Testing device connections..."));
-  //Serial.println(mpu.testConnection() ? F("MPU6050 connection successful") : F("MPU6050 connection failed"));
-
-  // load and configure the DMP
-  //Serial.println(F("Initializing DMP..."));
-  devStatus = mpu.dmpInitialize();
-
-  // supply your own gyro offsets here, scaled for min sensitivity
-  mpu.setXGyroOffset(220);
-  mpu.setYGyroOffset(76);
-  mpu.setZGyroOffset(-85);
-  mpu.setZAccelOffset(1788); // 1688 factory default for my test chip
-
-  // make sure it worked (returns 0 if so)
-  if (devStatus == 0)
-  {
-    // turn on the DMP, now that it's ready
-    // Serial.println(F("Enabling DMP..."));
-    mpu.setDMPEnabled(true);
-
-    // enable Arduino interrupt detection
-    //Serial.println(F("Enabling interrupt detection (Arduino external interrupt 0)..."));
-    attachInterrupt(3, dmpDataReady, RISING);
-    mpuIntStatus = mpu.getIntStatus();
-
-    // set our DMP Ready flag so the main loop() function knows it's okay to use it
-    //Serial.println(F("DMP ready! Waiting for first interrupt..."));
-    dmpReady = true;
-
-    // get expected DMP packet size for later comparison
-    packetSize = mpu.dmpGetFIFOPacketSize();
-
-
-
-  }
-  else
-  {
-    // ERROR!
-    // 1 = initial memory load failed
-    // 2 = DMP configuration updates failed
-    // (if it's going to break, usually the code will be 1)
-    //Serial.print(F("DMP Initialization failed (code "));
-    //Serial.print(devStatus);
-    //Serial.println(F(")"));
-  }
 
   //------------------INIT IRQ TEMPO------------------------------
   Timer1.initialize(100000);         // initialize timer1
@@ -309,7 +273,7 @@ void setup() {
   // MyPlot.SetSeriesProperties("OutputPos", Plot::Magenta, Plot::Solid, 1, Plot::NoMarker);
   MyPlot.SetSeriesProperties("OutputPos", Plot::Green, Plot::Solid, 1, Plot::NoMarker);
   MyPlot.SetSeriesProperties("SetpointPos", Plot::Red, Plot::Solid, 1, Plot::NoMarker);
-  MyPlot.SetSeriesProperties("Angle", Plot::Blue, Plot::Solid, 1, Plot::NoMarker);
+  MyPlot.SetSeriesProperties("Acc_angle", Plot::Blue, Plot::Solid, 1, Plot::NoMarker);
 
   // interrupts();
 }
@@ -357,62 +321,7 @@ void loop() {
 
 
   //----------------------LECTURE GYRO-----------------
-  // if programming failed, don't try to do anything
-  if (!dmpReady) return;
-
-  // wait for MPU interrupt or extra packet(s) available
-  while (!mpuInterrupt && fifoCount < packetSize)
-  {
-    //no mpu data - performing PID calculations and output to motors
-    Serial.println("foutu");
-  }
-
-  // reset interrupt flag and get INT_STATUS byte
-  mpuInterrupt = false;
-  mpuIntStatus = mpu.getIntStatus();
-
-  // get current FIFO count
-  fifoCount = mpu.getFIFOCount();
-
-  // check for overflow (this should never happen unless our code is too inefficient)
-  if ((mpuIntStatus & 0x10) || fifoCount == 1024)
-  {
-    // reset so we can continue cleanly
-    mpu.resetFIFO();
-    //Serial.println(F("FIFO overflow!"));
-
-    // otherwise, check for DMP data ready interrupt (this should happen frequently)
-  }
-  else if (mpuIntStatus & 0x02)
-  {
-    // wait for correct available data length, should be a VERY short wait
-    while (fifoCount < packetSize) fifoCount = mpu.getFIFOCount();
-
-    // read a packet from FIFO
-    mpu.getFIFOBytes(fifoBuffer, packetSize);
-
-    // track FIFO count here in case there is > 1 packet available
-    // (this lets us immediately read more without waiting for an interrupt)
-    fifoCount -= packetSize;
-
-    mpu.dmpGetQuaternion(&q, fifoBuffer);
-    mpu.dmpGetGravity(&gravity, &q);
-    mpu.dmpGetYawPitchRoll(ypr, &q, &gravity);
-#if LOG_INPUT
-    // Serial.print("ypr\t");
-    //Serial.print(ypr[0] * 180/M_PI);
-    // Serial.print("\t");
-    //Serial.print(ypr[1] * 180/M_PI);
-    // Serial.print("\t");
-    //Serial.println(ypr[2] * 180/M_PI);
-#endif
-    Angle = ypr[2] * 180 / M_PI + 180;
-    AngleMemo = ((AngleMemo * 6) + Angle) / 7;
-    // Serial.print ("Angle: ");
-    //Serial.println(Angle);
-  }
-
-
+  angle_calc();
   //---------------BOUTON--ONS--------------------
   BPVal = analogRead(BP);
   if (BPVal == 0) { //-cond ons
@@ -455,12 +364,21 @@ void loop() {
 
 
   //-----------------PID POSITION DANS ROUTINE GYRO-------------
-  SetpointPos = 185; //116.0; map(analogRead(sensorPin), 0 , 800, 0, -100);
-  InputPos = Angle;
+  SetpointPos = 78; //116.0; map(analogRead(sensorPin), 0 , 800, 0, -100);
+  InputPos = Acc_angle;
+  //Bande Morte
+  DiffPos = abs(SetpointPos - InputPos);
+  if  (DiffPos < 1) {
+    myPIDPos.SetTunings(KpPosD, KiPosD, KdPosD);
+  } else {
+    myPIDPos.SetTunings(KpPos, KiPos, KdPos);
+  }
 
   myPIDPos.Compute();
-  CSG_OUTPUTV1Pos = abs( OutputPos);
-  if ((CSG_OUTPUTV1Pos > 1) & (CSG_OUTPUTV1Pos < 100) ) CSG_OUTPUTV1Pos = 100;
+  CSG_OUTPUTV1Pos = abs( OutputPos) + 50;
+  //if ((CSG_OUTPUTV1Pos > 1) & (CSG_OUTPUTV1Pos < 100) ) CSG_OUTPUTV1Pos = 100;
+
+
   //-----------------PID VITESSE-------------
   // Setpoint = CSG_OUTPUTV1Pos;
   // Input = Vit1;
@@ -576,7 +494,7 @@ void loop() {
   //MyPlot.SendData("OutputPos", OutputPos);
   MyPlot.SendData("OutputPos", OutputPos);
   MyPlot.SendData("SetpointPos", SetpointPos);
-  MyPlot.SendData("Angle", Angle);
+  MyPlot.SendData("Acc_angle", Acc_angle);
   // }
 
 }
@@ -600,32 +518,110 @@ int Tempos( int NUM, int PRESEL) {
   return TDN[NUM];
 }
 
-void setup_mpu_6050_registers() {
-  //Activate the MPU-6050
-  Wire.beginTransmission(0x68);                                        //Start communicating with the MPU-6050
-  Wire.write(0x6B);                                                    //Send the requested starting register
-  Wire.write(0x00);                                                    //Set the requested starting register
-  Wire.endTransmission();
-  //Configure the accelerometer (+/-8g)
-  Wire.beginTransmission(0x68);                                        //Start communicating with the MPU-6050
-  Wire.write(0x1C);                                                    //Send the requested starting register
-  Wire.write(0x10);                                                    //Set the requested starting register
-  Wire.endTransmission();
-  //Configure the gyro (500dps full scale)
-  Wire.beginTransmission(0x68);                                        //Start communicating with the MPU-6050
-  Wire.write(0x1B);                                                    //Send the requested starting register
-  Wire.write(0x08);                                                    //Set the requested starting register
-  Wire.endTransmission();
+//------------------------------------------------------------------
+//Robot angle calculations------------------------------------------
+//------------------------------------------------------------------
+
+void writeTo(byte device, byte address, byte value) {
+  Wire.beginTransmission(device);
+  Wire.write(address);
+  Wire.write(value);
+  Wire.endTransmission(true);
 }
 
-void MiseAiP() {
-  //------------------PID POSITION--------------
-  myPIDPos.SetMode(AUTOMATIC);
-  myPIDPos.SetOutputLimits(-290, 290);
-  myPIDPos.SetSampleTime(10);
+//setup MPU6050
+void angle_init() {
+  Wire.begin();
+  delay (100);
+  writeTo(MPU6050, PWR_MGMT_1, 0);
+  writeTo(MPU6050, ACCEL_CONFIG, accSens << 3); // Specifying output scaling of accelerometer
+  writeTo(MPU6050, GYRO_CONFIG, gyroSens << 3); // Specifying output scaling of gyroscope
+  delay (100);
 
-  //------------------PID VITESSE--------------
-  myPID.SetMode(AUTOMATIC);
-  myPID.SetOutputLimits(0, 255);
-  myPID.SetSampleTime(10);
+  // calc Z gyro offset by averaging 1024 values
+  if (GyY_filter_on == true)
+  {
+    GyY_filter_on = false;
+    for (int i = 0; i < 1024; i++)
+    {
+      angle_calc();
+      //    //Serial.println(GyY);
+      GyY_offset_sum += GyY;
+      //      digitalWrite(LEDPIN, !digitalRead(LEDPIN));
+      delay (10);
+    }
+    GyY_filter_on = true;
+  }
+  else
+  {
+    for (int i = 0; i < 1024; i++)
+    {
+      angle_calc();
+      ////Serial.println(GyY);
+      GyY_offset_sum += GyY;
+      //      digitalWrite(LEDPIN, !digitalRead(LEDPIN));
+      delay (10);
+    }
+  }
+  GyY_offset = GyY_offset_sum >> 10;
+  // Serial.print("GyY offset value = ");
+  //Serial.println(GyY_offset);
+}
+
+
+//calculate robot tilt angle
+void angle_calc()
+{
+  // read raw accel/gyro measurements from device
+  Wire.beginTransmission(MPU6050);
+  Wire.write(0x3B);                  // starting with register 0x3B (ACCEL_XOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050, 2, true); // request a total of 2 registers
+  AcX = Wire.read() << 8 | Wire.read(); // 0x3B (ACCEL_XOUT_H) & 0x3C (ACCEL_XOUT_L)
+
+  Wire.beginTransmission(MPU6050);
+  Wire.write(0x3F);          // starting with register 0x3F (ACCEL_ZOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050, 2, true);  // request a total of 2 registers
+  AcZ = Wire.read() << 8 | Wire.read(); // 0x3F (ACCEL_ZOUT_H) & 0x40 (ACCEL_ZOUT_L)
+
+  Wire.beginTransmission(MPU6050);
+  Wire.write(0x45);       // starting with register 0x45 (GYRO_YOUT_H)
+  Wire.endTransmission(false);
+  Wire.requestFrom(MPU6050, 2, true);  // request a total of 2 registers
+  GyY = Wire.read() << 8 | Wire.read(); // 0x45 (GYRO_YOUT_H) & 0x46 (GYRO_YOUT_L)
+
+  if (GyY_filter_on == true)
+  {
+    // simple low pass filter on gyro
+    GyY_filter[filter_count] = GyY;
+
+    filter_count++;
+
+    if (filter_count > 15) filter_count = 0;
+
+    GyY_F = 0;
+    for (int i = 0; i < 16; i++)
+    {
+      GyY_F += GyY_filter[i];
+      GyY = GyY_F >> 4;
+    }
+  }
+
+  // add mpu6050 offset values
+  AcZ += AcZ_offset;
+  AcX += AcX_offset;
+  GyY += GyY_offset;
+
+  //use complementary filter to calculate robot angle
+  robot_angle -= GyY * 6.07968E-5;                      //integrate gyroscope to get angle       * 0.003984 (sec) / 65.536 (bits / (deg/sec))
+  //robot_angle += GyY * 6.07968E-5;                      //integrate gyroscope to get angle       * 0.003984 (sec) / 65.536 (bits / (deg/sec))
+  Acc_angleMemo =  atan2(AcX, -AcZ) * 57.2958;              //angle from acc. values       * 57.2958 (deg/rad)
+  Acc_angle = (((Acc_angle * 4) + Acc_angleMemo) / 5);
+  robot_angle = robot_angle * Gyro_amount + Acc_angleMemo * (1.0 - Gyro_amount);
+
+
+  //check if robot is vertical
+  if (robot_angle > 50 || robot_angle < -50) vertical = false;
+  if (robot_angle < 1 && robot_angle > -1) vertical = true;
 }
